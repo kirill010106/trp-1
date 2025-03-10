@@ -1,11 +1,11 @@
 package main
 
 import (
-	"bufio"
-	"fmt"
+	"io"
 	"log"
 	"net"
-	"os"
+	"strings"
+	"sync"
 )
 
 type Server struct {
@@ -25,59 +25,141 @@ func (s *Server) Listen() error {
 	return err
 }
 
-func main() {
-	l, err := net.Listen("tcp", ":2000")
-	if err != nil {
-		log.Println("Error listening to port: 2000, Error: ", err.Error())
+type RoomID int
+
+type Room struct {
+	RoomId   RoomID
+	users    []User
+	RoomName string
+}
+
+func (r *Room) getUsers() []User {
+	return r.users
+}
+
+func (r *Room) AddUser(user User) bool {
+	users := r.getUsers()
+	for _, roomUser := range users {
+		if roomUser.Addr.String() == user.Addr.String() {
+			return false
+		}
 	}
+	r.users = append(r.users, user)
+	return true
+}
+
+func (r *Room) DistributeMsg(fromUser string, msg string) *ErrorChan {
+	errChan := ErrorChan{
+		ErrMap: make(map[string]error),
+	}
+
+	var wg sync.WaitGroup
+	for _, usr := range r.getUsers() {
+		if usr.Addr.String() != fromUser {
+			wg.Add(1)
+			go func(usr User) {
+				defer wg.Done()
+				conn := *usr.GetConnection()
+				addstr := strings.Split(fromUser, ":")
+
+				_, err := conn.Write([]byte(
+					"/" + addstr[len(addstr)-1] + ": " + msg + "\n",
+				))
+				if err != nil {
+					errChan.AddNewRoutineError(
+						conn.RemoteAddr().String(),
+						err,
+					)
+				}
+			}(usr)
+		}
+	}
+
+	wg.Wait()
+	return &errChan
+}
+
+type User struct {
+	Addr   net.Addr
+	RoomId RoomID
+	conn   *net.Conn
+	Room   *Room
+}
+
+func (u *User) GetConnection() *net.Conn {
+	return u.conn
+}
+
+func (u *User) GetARoomYouGuys() *Room {
+	return u.Room
+}
+
+type ErrorChan struct {
+	mu     sync.Mutex
+	ErrMap map[string]error
+}
+
+func (ec *ErrorChan) AddNewRoutineError(routineAddr string, err error) {
+	ec.mu.Lock()
+	defer ec.mu.Unlock()
+	ec.ErrMap[routineAddr] = err
+}
+
+func main() {
+	server := NewServer(":2000")
+	err := server.Listen()
+
+	var roomId RoomID = 10
+	room := Room{
+		RoomId:   roomId,
+		RoomName: "common-room",
+	}
+	if err != nil {
+		log.Fatalf(
+			"Could not listen to port because skill issues: %s\n",
+			err.Error())
+	}
+
 	for {
-		conn, err := l.Accept()
+		conn, err := server.Ln.Accept()
 		if err != nil {
-			log.Printf("Error: %s while connecting to addr: %s\n",
-				err.Error(), conn.RemoteAddr())
-		} else {
-			log.Printf("Connected succesfully to remote addr: %s\n",
+			log.Printf(
+				"Attemp to connect with server failed by Addr: %s\n",
 				conn.RemoteAddr())
 		}
 
-		go handleIncoming(conn)
-		go handleOutgoing(conn)
+		usr := User{
+			Addr:   conn.RemoteAddr(),
+			conn:   &conn,
+			RoomId: roomId,
+			Room:   &room,
+		}
+
+		room.AddUser(usr)
+
+		go HandleIncoming(usr)
 	}
 }
 
-func handleIncoming(conn net.Conn) {
-	defer conn.Close()
-	_, err := conn.Write([]byte(
-		"Your connection to the our server is succesful!\n"))
+func HandleIncoming(user User) {
+	conn := *user.GetConnection()
 	for {
-		buf := make([]byte, 64)
-
-		if err != nil {
-			log.Printf("Writing failed")
-		}
-
+		buf := make([]byte, 1024)
 		n, err := conn.Read(buf)
 		if err != nil {
-			log.Fatalf("Connection lost!")
+			if err == io.EOF {
+				log.Printf("User disconnected: %s\n", user.Addr.String())
+				return
+			}
+			log.Printf("Could not read message from user: %s\n", err.Error())
 		}
 
-		fmt.Printf("client:%s\n", string(buf[:n]))
-	}
-}
+		msg := string(buf[:n])
+		room := *user.GetARoomYouGuys()
 
-func handleOutgoing(conn net.Conn) {
-	defer conn.Close()
-	for {
-		reader := bufio.NewReader(os.Stdin)
-
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			log.Printf("Error while reading line\n")
-		}
-
-		_, err = conn.Write(fmt.Appendf(nil, "server: %s\n", line))
-		if err != nil {
-			log.Printf("Connection to addr: %s closed.\n", conn.RemoteAddr())
+		errChan := room.DistributeMsg(conn.RemoteAddr().String(), msg)
+		if len(errChan.ErrMap) != 0 {
+			log.Println("Some users didn't recieve the message")
 		}
 	}
 }
